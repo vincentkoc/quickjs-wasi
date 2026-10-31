@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, ci/checked-construction-766a8ed]
   pull_request:
     branches: [main]
 
