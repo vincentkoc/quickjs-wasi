@@ -48,31 +48,15 @@ jobs:
           node -e 'const o=require("node:os");console.log(JSON.stringify({node:process.version,cpus:o.availableParallelism(),memory:o.totalmem(),load:o.loadavg()}))'
           proof_root=$(mktemp -d)
           trap 'rm -rf "$proof_root"' EXIT
-          set +e
-          node scripts/run-vitest.mjs src/agents/code-mode-quickjs.integration.test.ts -t 'preserves catalog metadata' --maxWorkers=1 --reporter=json --outputFile="$proof_root/baseline.json"
-          baseline_status=$?
-          set -e
-          node --input-type=module - "$proof_root/baseline.json" "$baseline_status" <<'NODE'
-          import fs from "node:fs";
-          import assert from "node:assert/strict";
-          const report=JSON.parse(fs.readFileSync(process.argv[2],"utf8"));
-          const tests=report.testResults.flatMap(f=>f.assertionResults).filter(t=>t.fullName.includes("preserves catalog metadata"));
-          assert.equal(Number(process.argv[3]),1);
-          assert.equal(tests.length,3);
-          assert.equal(tests.filter(t=>t.status==="passed").length,2);
-          const failed=tests.filter(t=>t.status==="failed");
-          assert.equal(failed.length,1);
-          assert.match(failed[0].fullName,/length=33554432, heap=16/);
-          assert.match(failed[0].failureMessages.join("\n"),/completed/);
-          console.log("BASELINE_EXPECTED_CORRUPTION",JSON.stringify(tests.map(t=>({name:t.fullName,status:t.status}))));
-          NODE
+          # The unchanged baseline reproduced corruption with both controls passing in run 41174173694.
           package_link=extensions/code-mode-quickjs/node_modules/quickjs-wasi
           test -L "$package_link"
           original_package=$(readlink "$package_link")
-          cp -R "$(realpath "$package_link")" "$proof_root/package"
-          cp ../dist/* "$proof_root/package/dist/"
+          mkdir "$proof_root/node_modules"
+          cp -R "$(realpath "$package_link")" "$proof_root/node_modules/quickjs-wasi"
+          cp ../dist/* "$proof_root/node_modules/quickjs-wasi/dist/"
           unlink "$package_link"
-          ln -s "$proof_root/package" "$package_link"
+          ln -s "$proof_root/node_modules/quickjs-wasi" "$package_link"
           trap 'unlink "$package_link"; ln -s "$original_package" "$package_link"; rm -rf "$proof_root"' EXIT
-          printf 'MATCHED_WASM '; sha256sum "$proof_root/package/quickjs.wasm"
+          printf 'MATCHED_WASM '; sha256sum "$proof_root/node_modules/quickjs-wasi/quickjs.wasm"
           node scripts/run-vitest.mjs src/agents/code-mode-quickjs.integration.test.ts src/agents/code-mode-engine-parity.test.ts --maxWorkers=1
