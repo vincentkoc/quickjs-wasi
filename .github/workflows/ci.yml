@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [ci/callback-name-allocation]
   pull_request:
     branches: [main]
 
@@ -16,6 +16,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 3
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -40,3 +41,125 @@ jobs:
 
       - name: Run tests
         run: pnpm test
+
+      - name: Rebuild parent native code and require the exact negative control
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD HEAD^ HEAD^^
+          git submodule status
+          cat /tmp/wasi-sdk/VERSION
+          cp quickjs.wasm "$RUNNER_TEMP/candidate.wasm"
+          git show 766a8ed10bb0fc5745e354e0bf98db8bf9c2e4b3:c/interface.c > c/interface.c
+          make quickjs.wasm
+          cp quickjs.wasm "$RUNNER_TEMP/baseline.wasm"
+          set +e
+          pnpm test test/callback-name-failures.test.ts --reporter=json --outputFile="$RUNNER_TEMP/baseline-tests.json"
+          status=$?
+          set -e
+          test "$status" -eq 1
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          const report = JSON.parse(readFileSync(`${process.env.RUNNER_TEMP}/baseline-tests.json`, 'utf8'));
+          assert.equal(report.numFailedTests, 3);
+          assert.equal(report.numPassedTests, 5);
+          const failures = report.testResults.flatMap(result => result.assertionResults).filter(test => test.status === 'failed');
+          assert.deepEqual(failures.map(test => test.title).sort(), ['Latin-1', 'wide', 'surrogate pair'].map(kind => `does not dispatch after ${kind} name encoding fails`).sort());
+          for (const test of failures) assert.match(test.failureMessages.join('\n'), /\+\s+"empty": 1/);
+          console.log('NEGATIVE_CONTROL', JSON.stringify({ failed: report.numFailedTests, passed: report.numPassedTests, failures: failures.map(test => ({ title: test.title, messages: test.failureMessages })) }));
+          JS
+          git restore c/interface.c
+          cp "$RUNNER_TEMP/candidate.wasm" quickjs.wasm
+          sha256sum "$RUNNER_TEMP/baseline.wasm" "$RUNNER_TEMP/candidate.wasm" dist/*.js
+
+      - name: Matched successful callback cost
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/callback-cost.mjs" <<'JS'
+          import assert from 'node:assert/strict';
+          import { createHash } from 'node:crypto';
+          import { readFileSync, readdirSync } from 'node:fs';
+          import { cpus, loadavg, freemem } from 'node:os';
+          import { resolve } from 'node:path';
+          import { pathToFileURL } from 'node:url';
+          const [root, wasmPath, arm, pair] = process.argv.slice(2);
+          const { QuickJS } = await import(pathToFileURL(resolve(root, 'dist/index.js')));
+          const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+          const bytes = readFileSync(wasmPath);
+          const wasm = await WebAssembly.compile(bytes);
+          const values = [undefined, null, true, 42, 'ok'];
+          const expected = Array.from({ length: 1000 }, (_, i) => `${typeof values[i % 5]}:${String(values[i % 5])};`).join('');
+          const environment = () => ({ load: loadavg(), freeMemoryBytes: freemem() });
+          const start = environment();
+          const rows = [];
+          for (const name of ['probe', 'probe_\u0100\ud83e\udd8a']) {
+            using vm = await QuickJS.create({ wasm, memoryLimit: 64 * 1024 * 1024 });
+            let calls = 0;
+            let emptyCalls = 0;
+            vm.registerHostCallback('', () => { emptyCalls++; return vm.false; });
+            vm.newFunction(name, () => vm.hostToHandle(values[calls++ % values.length]))
+              .consume(handle => vm.global.setProp('probe', handle));
+            using guest = vm.evalCode(`(() => {
+              let out = '';
+              for (let i = 0; i < 1000; i++) {
+                const value = probe();
+                out += typeof value + ':' + String(value) + ';';
+              }
+              return out;
+            })`);
+            const samples = [];
+            for (let round = -20; round < 40; round++) {
+              calls = 0;
+              const handles = [];
+              const cpu = process.cpuUsage();
+              const at = performance.now();
+              for (let invocation = 0; invocation < 10; invocation++) {
+                handles.push(vm.withScope(scope => scope.escape(vm.callFunction(guest, vm.undefined))));
+              }
+              const wallMs = performance.now() - at;
+              const elapsedCpu = process.cpuUsage(cpu);
+              try {
+                assert.equal(calls, 10000);
+                assert.equal(emptyCalls, 0);
+                for (const result of handles) assert.equal(result.toString(), expected);
+              } finally {
+                for (const result of handles) result.dispose();
+              }
+              vm.runGC();
+              if (round >= 0) samples.push({ wallMs, cpuMs: (elapsedCpu.user + elapsedCpu.system) / 1000 });
+            }
+            rows.push({ name, samples });
+          }
+          console.log(JSON.stringify({ arm, pair: Number(pair), node: process.version, cpu: cpus()[0]?.model,
+            start, end: environment(), wasmSha256: hash(bytes), probeSha256: hash(readFileSync(new URL(import.meta.url))),
+            moduleSha256: Object.fromEntries(readdirSync(resolve(root, 'dist')).filter(name => name.endsWith('.js')).sort().map(name => [name, hash(readFileSync(resolve(root, 'dist', name)))])),
+            warmupBatches: 20, timedBatches: 40, callbacksPerBatch: 10000, rows }));
+          JS
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { execFileSync } from 'node:child_process';
+          import { resolve } from 'node:path';
+          const results = [];
+          for (let pair = 0; pair < 5; pair++) {
+            for (const arm of pair % 2 ? ['candidate', 'baseline'] : ['baseline', 'candidate']) {
+              const result = JSON.parse(execFileSync(process.execPath, [`${process.env.RUNNER_TEMP}/callback-cost.mjs`, process.cwd(), `${process.env.RUNNER_TEMP}/${arm}.wasm`, arm, String(pair)], { encoding: 'utf8', timeout: 180000, maxBuffer: 2 * 1024 * 1024 }));
+              results.push(result);
+              console.log('CALLBACK_RAW', JSON.stringify(result));
+            }
+          }
+          const median = values => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)];
+          const percentile = (values, fraction) => [...values].sort((a, b) => a - b)[Math.ceil(values.length * fraction) - 1];
+          const reference = results[0];
+          for (const result of results) {
+            assert.deepEqual(result.moduleSha256, reference.moduleSha256);
+            assert.equal(result.probeSha256, reference.probeSha256);
+            assert.equal(result.node, reference.node);
+          }
+          const summary = ['probe', 'probe_\u0100\ud83e\udd8a'].map(name => ({ name, pairs: Array.from({ length: 5 }, (_, pair) => {
+            const rows = Object.fromEntries(results.filter(result => result.pair === pair).map(result => [result.arm, result.rows.find(row => row.name === name).samples]));
+            return { pair, arms: Object.fromEntries(Object.entries(rows).map(([arm, samples]) => [arm, { wallMedianMs: median(samples.map(s => s.wallMs)), cpuMedianMs: median(samples.map(s => s.cpuMs)), wallP95Ms: percentile(samples.map(s => s.wallMs), .95), earlyMedianMs: median(samples.slice(0, 10).map(s => s.wallMs)), lateMedianMs: median(samples.slice(-10).map(s => s.wallMs)) }])), wallRatio: median(rows.candidate.map(s => s.wallMs)) / median(rows.baseline.map(s => s.wallMs)), cpuRatio: median(rows.candidate.map(s => s.cpuMs)) / median(rows.baseline.map(s => s.cpuMs)), wallDeltaNanosecondsPerCallback: (median(rows.candidate.map(s => s.wallMs)) - median(rows.baseline.map(s => s.wallMs))) * 100 };
+          }) }));
+          console.log('CALLBACK_SUMMARY', JSON.stringify(summary));
+          JS
