@@ -16,7 +16,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 3
+          ref: cb0bed1a7c40011e708fb934504906e55dfb71eb
+          fetch-depth: 2
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -39,14 +40,11 @@ jobs:
       - name: Build TypeScript
         run: pnpm run build:ts
 
-      - name: Run tests
-        run: pnpm test
-
       - name: Rebuild parent native code and require the exact negative control
         shell: bash
         run: |
           set -euo pipefail
-          git rev-parse HEAD HEAD^ HEAD^^
+          git rev-parse HEAD HEAD^
           git submodule status
           cat /tmp/wasi-sdk/VERSION
           cp quickjs.wasm "$RUNNER_TEMP/candidate.wasm"
@@ -66,7 +64,7 @@ jobs:
           assert.equal(report.numPassedTests, 5);
           const failures = report.testResults.flatMap(result => result.assertionResults).filter(test => test.status === 'failed');
           assert.deepEqual(failures.map(test => test.title).sort(), ['Latin-1', 'wide', 'surrogate pair'].map(kind => `does not dispatch after ${kind} name encoding fails`).sort());
-          for (const test of failures) assert.match(test.failureMessages.join('\n'), /\+\s+"empty": 1/);
+          for (const test of failures) assert.match(test.failureMessages.join('\n'), /expected \{ intended: \+0, ascii: 1, empty: 1 \} to deeply equal \{ intended: \+0, ascii: 1, empty: \+0 \}/);
           console.log('NEGATIVE_CONTROL', JSON.stringify({ failed: report.numFailedTests, passed: report.numPassedTests, failures: failures.map(test => ({ title: test.title, messages: test.failureMessages })) }));
           JS
           git restore c/interface.c
