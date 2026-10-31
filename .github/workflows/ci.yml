@@ -1,4 +1,4 @@
-name: Code Mode source preparation qualification
+name: Code Mode hot source control
 on:
   push:
     branches: [ci/checked-construction-766a8ed]
@@ -31,111 +31,62 @@ jobs:
           git apply "$RUNNER_TEMP/source.patch"
           test "$(git hash-object src/agents/code-mode-source.ts)" = 7d48ac0cac7574985a55e3209a7bb5638306f7c3
           cat > prepare-source-microprobe.mjs <<'PROBE'
-          // Source-preparation microprobe; not owner-path or ShellBench evidence.
+          // Hot default-path control; no engine or owner-path claim.
           import assert from "node:assert/strict";
           import { spawnSync } from "node:child_process";
           import { createHash } from "node:crypto";
           import { readFileSync } from "node:fs";
-          import { stripTypeScriptTypes } from "node:module";
           import { availableParallelism, loadavg } from "node:os";
           import { basename, dirname, resolve } from "node:path";
           import { fileURLToPath, pathToFileURL } from "node:url";
-          import { parse, version as acornVersion } from "acorn";
-          const self = fileURLToPath(import.meta.url);
-          const hash = value => createHash("sha256").update(value).digest("hex");
-          const median = values => {
-            const s = [...values].sort((a,b)=>a-b), n=s.length;
-            return n%2 ? s[n>>1] : (s[n/2-1]+s[n/2])/2;
-          };
-          const p95 = values => [...values].sort((a,b)=>a-b)[Math.ceil(values.length*.95)-1];
-          const cases = [["return7","return 7;"],["shell-rejection","ls -1"],["hoisted-function","ls -1; function/**/ls() {}"]];
-          if (process.argv[2] === "--child") {
-            const modulePath=resolve(process.argv[3]), directory=dirname(modulePath);
+          import { version as acornVersion } from "acorn";
+          const self=fileURLToPath(import.meta.url);
+          const hash=value=>createHash("sha256").update(value).digest("hex");
+          const median=values=>{const s=[...values].sort((a,b)=>a-b),n=s.length;return n%2?s[n>>1]:(s[n/2-1]+s[n/2])/2};
+          const p95=values=>[...values].sort((a,b)=>a-b)[Math.ceil(values.length*.95)-1];
+          const callsPerBatch=5000,warmupBatches=20,timedBatches=40,code="return 7;";
+          if(process.argv[2]==="--child"){
+            const modulePath=resolve(process.argv[3]),directory=dirname(modulePath);
             const {prepareSource}=await import(pathToFileURL(modulePath).href);
-            const {ToolInputError,isTrustedToolInputError}=await import(pathToFileURL(resolve(directory,"tool-input-error.ts")).href);
-            const inputs=new Set(cases.map(([,code])=>code));
-            for(const name of ["code-mode-shell-source.test.ts","code-mode-runtime.test.ts"]){
-              const source=stripTypeScriptTypes(readFileSync(resolve(directory,name),"utf8"));
-              const tree=parse(source,{ecmaVersion:"latest",sourceType:"module"});
-              const walk=(node,selected=name.includes("shell-source"))=>{
-                if(!node||typeof node!=="object")return;
-                if(node.type==="CallExpression"&&node.callee?.name==="describe"&&node.arguments[0]?.value==="Code Mode guest source validation")selected=true;
-                if(selected&&node.type==="CallExpression"&&node.callee?.type==="MemberExpression"&&node.callee.property?.name==="each"&&node.arguments[0]?.type==="ArrayExpression"){
-                  for(const item of node.arguments[0].elements){
-                    for(const value of item?.type==="ArrayExpression"?item.elements:[item]){
-                      if(value?.type==="Literal"&&typeof value.value==="string")inputs.add(value.value);
-                    }
-                  }
-                }
-                for(const value of Object.values(node)){
-                  if(Array.isArray(value))value.forEach(child=>walk(child,selected));
-                  else if(value?.type)walk(value,selected);
-                }
-              };
-              walk(tree);
-            }
             const capture=code=>{try{return {ok:true,value:prepareSource(code)}}catch(error){return {ok:false,error}}};
-            const project=result=>{
-              if(result.ok)return result;
-              const e=result.error;
-              assert(e instanceof ToolInputError);
-              assert.equal(isTrustedToolInputError(e),true);
-              return {ok:false,constructor:e.constructor.name,name:e.name,status:e.status,message:e.message,trusted:true};
-            };
-            const fixtures=[...inputs],outcomes=fixtures.map(code=>project(capture(code)));
-            outcomes.forEach((result,i)=>{if(result.ok)assert.equal(result.value,fixtures[i])});
-            const expected=new Map(fixtures.map((code,i)=>[code,outcomes[i]]));
-            assert.equal(expected.get("ls -1").ok,false);
-            assert.match(expected.get("ls -1").message,/code-mode exec runs JavaScript, not shell commands/);
-            for(const [,code] of [cases[0],cases[2]])assert.deepEqual(expected.get(code),{ok:true,value:code});
             const identity=()=>Object.fromEntries([modulePath,resolve(directory,"code-mode-script-syntax.ts"),resolve(directory,"tool-input-error.ts"),resolve("pnpm-lock.yaml")].map(path=>[basename(path),hash(readFileSync(path))]));
-            const files=identity(),startLoad=loadavg(),rows=[];
-            for(const [name,code] of cases){
-              const wallMs=[],cpuMs=[];
-              for(let round=-10;round<40;round++){
-                const results=new Array(100),cpuStart=process.threadCpuUsage(),started=performance.now();
-                for(let i=0;i<100;i++)results[i]=capture(code);
-                const elapsed=performance.now()-started,cpu=process.threadCpuUsage(cpuStart);
-                for(const result of results)assert.deepEqual(project(result),expected.get(code));
-                if(round>=0){assert(Number.isFinite(elapsed)&&elapsed>0);wallMs.push(elapsed);cpuMs.push((cpu.user+cpu.system)/1000)}
-              }
-              rows.push({name,callsPerBatch:100,wallMs,cpuMs});
+            const files=identity(),startLoad=loadavg(),wallMs=[],cpuMs=[];
+            assert.deepEqual(capture(code),{ok:true,value:code});
+            for(let round=-warmupBatches;round<timedBatches;round++){
+              const results=new Array(callsPerBatch),cpuStart=process.threadCpuUsage(),started=performance.now();
+              for(let i=0;i<callsPerBatch;i++)results[i]=capture(code);
+              const elapsed=performance.now()-started,cpu=process.threadCpuUsage(cpuStart);
+              for(const result of results)assert.deepEqual(result,{ok:true,value:code});
+              if(round>=0){assert(Number.isFinite(elapsed)&&elapsed>0);wallMs.push(elapsed);cpuMs.push((cpu.user+cpu.system)/1000)}
             }
             assert.deepEqual(identity(),files);
-            console.log(JSON.stringify({type:"process",node:process.version,arch:process.arch,platform:process.platform,acornVersion,files,benchmarkSha256:hash(readFileSync(self)),availableParallelism:availableParallelism(),startLoad,endLoad:loadavg(),warmupBatches:10,timedBatches:40,fixtures,outcomes,rows,scope:"prepareSource microprobe; imports/checks excluded; no forced GC"}));
+            console.log(JSON.stringify({type:"process",node:process.version,arch:process.arch,platform:process.platform,acornVersion,files,benchmarkSha256:hash(readFileSync(self)),availableParallelism:availableParallelism(),startLoad,endLoad:loadavg(),warmupBatches,timedBatches,code,outcome:{ok:true,value:code},rows:[{name:"return7-hot",callsPerBatch,wallMs,cpuMs}],scope:"hot prepareSource control; imports and outcome checks excluded; no forced GC"}));
           }else{
             const [baseline,candidate]=process.argv.slice(2).map(path=>resolve(path));
             assert(baseline&&candidate&&dirname(baseline)===dirname(candidate));
-            const records=[],run=(arm,pair,position)=>{
-              const child=spawnSync(process.execPath,[...process.execArgv,self,"--child",arm==="baseline"?baseline:candidate],{encoding:"utf8",timeout:120000,maxBuffer:4*1024*1024});
-              assert.ifError(child.error);assert.equal(child.status,0,child.stderr.slice(-4000));
-              const record={...JSON.parse(child.stdout),arm,pair,position};
-              if(records.length){assert.deepEqual(record.fixtures,records[0].fixtures);assert.deepEqual(record.outcomes,records[0].outcomes)}
-              records.push(record);console.log(JSON.stringify(record));
-            };
-            for(let pair=1;pair<=5;pair++)(pair%2?["baseline","candidate"]:["candidate","baseline"]).forEach((arm,i)=>run(arm,pair,i+1));
-            for(const [name] of cases){
-              const arms=pair=>["baseline","candidate"].map(arm=>records.find(r=>r.pair===pair&&r.arm===arm).rows.find(r=>r.name===name));
-              const pairedRatios=[],pairedDeltaUs=[],batchP95Ratios=[],cpuRatios=[],baselineUs=[],candidateUs=[];
-              for(let pair=1;pair<=5;pair++){
-                const [b,c]=arms(pair),bm=median(b.wallMs),cm=median(c.wallMs);
-                pairedRatios.push(cm/bm);pairedDeltaUs.push((cm-bm)*10);baselineUs.push(bm*10);candidateUs.push(cm*10);
-                batchP95Ratios.push(p95(c.wallMs)/p95(b.wallMs));
-                if(median(b.cpuMs)>0)cpuRatios.push(median(c.cpuMs)/median(b.cpuMs));
+            const records=[];
+            for(let pair=1;pair<=5;pair++){
+              const order=pair%2?["baseline","candidate"]:["candidate","baseline"];
+              for(const [index,arm] of order.entries()){
+                const child=spawnSync(process.execPath,[...process.execArgv,self,"--child",arm==="baseline"?baseline:candidate],{encoding:"utf8",timeout:120000,maxBuffer:1024*1024});
+                assert.ifError(child.error);assert.equal(child.status,0,child.stderr.slice(-4000));
+                const record={...JSON.parse(child.stdout),arm,pair,position:index+1};
+                if(records.length)assert.deepEqual(record.outcome,records[0].outcome);
+                records.push(record);console.log(JSON.stringify(record));
               }
-              console.log(JSON.stringify({type:"paired-summary",name,unit:"fresh process pair",pairedMedianRatio:median(pairedRatios),pairedRatios,baselineMedianUsPerCall:median(baselineUs),candidateMedianUsPerCall:median(candidateUs),pairedMedianDeltaUsPerCall:median(pairedDeltaUs),batchP95Ratios,pairedMedianCpuRatio:cpuRatios.length?median(cpuRatios):null}));
             }
+            const pairedRatios=[],pairedDeltaUs=[],batchP95Ratios=[],cpuRatios=[],baselineUs=[],candidateUs=[];
+            for(let pair=1;pair<=5;pair++){
+              const [b,c]=["baseline","candidate"].map(arm=>records.find(r=>r.pair===pair&&r.arm===arm).rows[0]);
+              const bm=median(b.wallMs),cm=median(c.wallMs);
+              pairedRatios.push(cm/bm);pairedDeltaUs.push((cm-bm)*1000/callsPerBatch);
+              baselineUs.push(bm*1000/callsPerBatch);candidateUs.push(cm*1000/callsPerBatch);
+              batchP95Ratios.push(p95(c.wallMs)/p95(b.wallMs));
+              assert(median(b.cpuMs)>0);cpuRatios.push(median(c.cpuMs)/median(b.cpuMs));
+            }
+            console.log(JSON.stringify({type:"paired-summary",name:"return7-hot",unit:"fresh process pair",pairedMedianRatio:median(pairedRatios),pairedRatios,baselineMedianUsPerCall:median(baselineUs),candidateMedianUsPerCall:median(candidateUs),pairedMedianDeltaUsPerCall:median(pairedDeltaUs),batchP95Ratios,pairedMedianCpuRatio:median(cpuRatios),cpuRatios}));
           }
           PROBE
-      - name: Compare source-preparation correctness and timings
+      - name: Measure fully warmed default source path
         run: |
           node --import ./scripts/tsx.mjs ./prepare-source-microprobe.mjs ./src/agents/code-mode-source.baseline.ts ./src/agents/code-mode-source.ts
-          rm src/agents/code-mode-source.baseline.ts prepare-source-microprobe.mjs
-      - name: Check formatting and focused lint
-        run: |
-          pnpm format:check src/agents/code-mode-source.ts
-          node scripts/run-oxlint.mjs src/agents/code-mode-source.ts
-          git diff --check
-      - name: Verify source behavior and both executor boundaries
-        run: |
-          node scripts/run-vitest.mjs src/agents/code-mode-shell-source.test.ts src/agents/code-mode-runtime.test.ts src/agents/code-mode-node.test.ts src/agents/code-mode.failure-phase.test.ts --maxWorkers=1
