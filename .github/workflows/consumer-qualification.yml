@@ -1,0 +1,78 @@
+name: Code Mode consumer qualification
+on:
+  push:
+    branches: [ci/consumer-qualification-766a8ed]
+permissions:
+  contents: read
+jobs:
+  consumer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 766a8ed10bb0fc5745e354e0bf98db8bf9c2e4b3
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26.7.0
+      - uses: pnpm/action-setup@v4
+      - name: Compile exact producer source
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build:ts
+          test "$(git hash-object src/index.ts)" = a77c74543995ea895c6151a359dbed3426763b82
+      - uses: actions/checkout@v4
+        with:
+          repository: openclaw/openclaw
+          ref: b7a537eb6833ea16960c227d5fc223fcd08ccef6
+          path: consumer
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: consumer/package.json
+      - name: Install frozen consumer and add the boundary regression
+        working-directory: consumer
+        env:
+          TEST_PATCH: ZGlmZiAtLWdpdCBhL3NyYy9hZ2VudHMvY29kZS1tb2RlLXF1aWNranMuaW50ZWdyYXRpb24udGVzdC50cyBiL3NyYy9hZ2VudHMvY29kZS1tb2RlLXF1aWNranMuaW50ZWdyYXRpb24udGVzdC50cwppbmRleCBlY2NhYTc4NWJjOS4uMzJhZWQ2MzI2ZjEgMTAwNjQ0Ci0tLSBhL3NyYy9hZ2VudHMvY29kZS1tb2RlLXF1aWNranMuaW50ZWdyYXRpb24udGVzdC50cworKysgYi9zcmMvYWdlbnRzL2NvZGUtbW9kZS1xdWlja2pzLmludGVncmF0aW9uLnRlc3QudHMKQEAgLTgsNiArOCw2MyBAQCBhZnRlckVhY2goY29kZU1vZGUucmVzZXRDb2RlTW9kZVRlc3RTdGF0ZSk7CiBjb25zdCBxdWlja2pzID0geyBjb2RlTW9kZTogeyBleGVjdXRvcjogInF1aWNranMiIGFzIGNvbnN0IH0gfTsKIGNvbnN0IHRleHRPdXRwdXQgPSAoLi4udGV4dHM6IHN0cmluZ1tdKSA9PiB0ZXh0cy5tYXAoKHRleHQpID0+ICh7IHR5cGU6ICJ0ZXh0IiwgdGV4dCB9KSk7CiAKK2l0LmVhY2goWworICB7IGxlbmd0aDogNDA5NiwgaGVhcE1pQjogMTYsIGNvbXBsZXRlOiB0cnVlIH0sCisgIHsgbGVuZ3RoOiAzMiAqIDEwMjQgKiAxMDI0LCBoZWFwTWlCOiAxMjgsIGNvbXBsZXRlOiB0cnVlIH0sCisgIHsgbGVuZ3RoOiAzMiAqIDEwMjQgKiAxMDI0LCBoZWFwTWlCOiAxNiwgY29tcGxldGU6IGZhbHNlIH0sCitdKSgKKyAgInByZXNlcnZlcyBjYXRhbG9nIG1ldGFkYXRhIG9yIGZhaWxzIGJlZm9yZSBkaXNwYXRjaCAobGVuZ3RoPSRsZW5ndGgsIGhlYXA9JGhlYXBNaUIpIiwKKyAgYXN5bmMgKHsgbGVuZ3RoLCBoZWFwTWlCLCBjb21wbGV0ZSB9KSA9PiB7CisgICAgY29uc3QgZGVzY3JpcHRpb24gPSAiYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXowMTIzNDUiCisgICAgICAucmVwZWF0KE1hdGguY2VpbChsZW5ndGggLyAzMikpCisgICAgICAuc2xpY2UoMCwgbGVuZ3RoKTsKKyAgICBjb25zdCB0YXJnZXQgPSBjb2RlTW9kZS5qc29uVG9vbCgiZml4dHVyZV9wcmVzc3VyZSIsIHRydWUsIGRlc2NyaXB0aW9uKTsKKyAgICBjb25zdCBhZnRlciA9IGNvZGVNb2RlLmpzb25Ub29sKCJmaXh0dXJlX2FmdGVyIiwgdHJ1ZSk7CisgICAgY29uc3QgaCA9IGNvZGVNb2RlLmNyZWF0ZUNhdGFsb2dDb2RlTW9kZUhhcm5lc3MoW3RhcmdldCwgYWZ0ZXJdLCB7CisgICAgICBjb2RlTW9kZTogeworICAgICAgICBleGVjdXRvcjogInF1aWNranMiLAorICAgICAgICBtZW1vcnlMaW1pdEJ5dGVzOiBoZWFwTWlCICogMTAyNCAqIDEwMjQsCisgICAgICAgIHRpbWVvdXRNczogNjBfMDAwLAorICAgICAgfSwKKyAgICB9KTsKKyAgICBjb25zdCByZXN1bHQgPSBhd2FpdCBoLmNvbXBsZXRlKGAKKyAgICB0ZXh0KCJndWVzdCBlbnRlcmVkIik7CisgICAgY29uc3QgdmFsdWUgPSBjYXRhbG9nLmFsbCgpLmZpbmQoZW50cnkgPT4gZW50cnkudG9vbE5hbWUgPT09ICJmaXh0dXJlX3ByZXNzdXJlIik/LmRlc2NyaXB0aW9uOworICAgIGNvbnN0IHBhdHRlcm4gPSAiYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXowMTIzNDUiOworICAgIGxldCBtaXNtYXRjaGVzID0gMDsKKyAgICBpZiAodHlwZW9mIHZhbHVlID09PSAic3RyaW5nIikgeworICAgICAgZm9yIChsZXQgaSA9IDA7IGkgPCB2YWx1ZS5sZW5ndGg7IGkrKykgeworICAgICAgICBpZiAodmFsdWUuY2hhckNvZGVBdChpKSAhPT0gcGF0dGVybi5jaGFyQ29kZUF0KGkgJSAzMikpIG1pc21hdGNoZXMrKzsKKyAgICAgIH0KKyAgICB9CisgICAgYXdhaXQgZml4dHVyZV9hZnRlcih7fSk7CisgICAgcmV0dXJuIHsgdHlwZTogdHlwZW9mIHZhbHVlLCBsZW5ndGg6IHZhbHVlPy5sZW5ndGgsIG1pc21hdGNoZXMgfTsKKyAgYCk7CisgICAgaWYgKGNvbXBsZXRlKSB7CisgICAgICBleHBlY3QocmVzdWx0KS50b01hdGNoT2JqZWN0KHsKKyAgICAgICAgc3RhdHVzOiAiY29tcGxldGVkIiwKKyAgICAgICAgdmFsdWU6IHsgdHlwZTogInN0cmluZyIsIGxlbmd0aCwgbWlzbWF0Y2hlczogMCB9LAorICAgICAgfSk7CisgICAgICBjb2RlTW9kZS5leHBlY3RUb29sQ2FsbHMoMSwgYWZ0ZXIpOworICAgIH0gZWxzZSB7CisgICAgICBleHBlY3QocmVzdWx0KS50b01hdGNoT2JqZWN0KHsKKyAgICAgICAgc3RhdHVzOiAiZmFpbGVkIiwKKyAgICAgICAgY29kZTogImludGVybmFsX2Vycm9yIiwKKyAgICAgICAgZmFpbHVyZVBoYXNlOiAiaG9zdCIsCisgICAgICAgIGJyaWRnZURpc3BhdGNoU3RhcnRlZDogZmFsc2UsCisgICAgICAgIGVycm9yOiBleHBlY3Quc3RyaW5nTWF0Y2hpbmcoL291dCBvZiBtZW1vcnkvaSksCisgICAgICAgIG91dHB1dDogW10sCisgICAgICB9KTsKKyAgICAgIGNvZGVNb2RlLmV4cGVjdFRvb2xDYWxscygwLCBhZnRlcik7CisgICAgfQorICAgIGNvZGVNb2RlLmV4cGVjdFRvb2xDYWxscygwLCB0YXJnZXQpOworICAgIGV4cGVjdChjb2RlTW9kZS50ZXN0aW5nLmFjdGl2ZVJ1bnMuc2l6ZSkudG9CZSgwKTsKKyAgICBjb25zdCBmcmVzaCA9IGNvZGVNb2RlLmNyZWF0ZUNhdGFsb2dDb2RlTW9kZUhhcm5lc3MoW10sIHF1aWNranMpOworICAgIGV4cGVjdChhd2FpdCBmcmVzaC5jb21wbGV0ZSgicmV0dXJuIDQyOyIpKS50b01hdGNoT2JqZWN0KHsgc3RhdHVzOiAiY29tcGxldGVkIiwgdmFsdWU6IDQyIH0pOworICAgIGV4cGVjdChjb2RlTW9kZS50ZXN0aW5nLmFjdGl2ZVJ1bnMuc2l6ZSkudG9CZSgwKTsKKyAgfSwKKyk7CisKIGl0KCJwcmVzZXJ2ZXMgZXZlcnkgbmFtZXNwYWNlIHJvdyB1bmRlciBoZWFwIHByZXNzdXJlIHdpdGhvdXQgc3Vic3RpdHV0aW5nIHRleHQiLCBhc3luYyAoKSA9PiB7CiAgIGNvbnN0IHJvd3MgPSBBcnJheS5mcm9tKHsgbGVuZ3RoOiAxMDBfMDAwIH0sIChfLCBpbmRleCkgPT4gKHsgaW5kZXgsIG1hcmtlcjogYHJvdzoke2luZGV4fWAgfSkpOwogICBmb3IgKGNvbnN0IGhlYXBNaUIgb2YgWzEyOCwgMTZdKSB7Cg==
+        run: |
+          pnpm install --frozen-lockfile
+          printf %s "$TEST_PATCH" | base64 --decode > "$RUNNER_TEMP/catalog.patch"
+          git apply --check "$RUNNER_TEMP/catalog.patch"
+          git apply "$RUNNER_TEMP/catalog.patch"
+          test "$(git hash-object src/agents/code-mode-quickjs.integration.test.ts)" = 32aed6326f16ae2d676c826462bdd36cffc894c1
+      - name: Verify original corruption and repaired consumer behavior
+        working-directory: consumer
+        run: |
+          set -euo pipefail
+          node -e 'const o=require("node:os");console.log(JSON.stringify({node:process.version,cpus:o.availableParallelism(),memory:o.totalmem(),load:o.loadavg()}))'
+          proof_root=$(mktemp -d)
+          trap 'rm -rf "$proof_root"' EXIT
+          set +e
+          node scripts/run-vitest.mjs src/agents/code-mode-quickjs.integration.test.ts -t 'preserves catalog metadata' --maxWorkers=1 --reporter=json --outputFile="$proof_root/baseline.json"
+          baseline_status=$?
+          set -e
+          node --input-type=module - "$proof_root/baseline.json" "$baseline_status" <<'NODE'
+          import fs from "node:fs";
+          import assert from "node:assert/strict";
+          const report=JSON.parse(fs.readFileSync(process.argv[2],"utf8"));
+          const tests=report.testResults.flatMap(f=>f.assertionResults).filter(t=>t.fullName.includes("preserves catalog metadata"));
+          assert.equal(Number(process.argv[3]),1);
+          assert.equal(tests.length,3);
+          assert.equal(tests.filter(t=>t.status==="passed").length,2);
+          const failed=tests.filter(t=>t.status==="failed");
+          assert.equal(failed.length,1);
+          assert.match(failed[0].fullName,/length=33554432, heap=16/);
+          assert.match(failed[0].failureMessages.join("\n"),/completed/);
+          console.log("BASELINE_EXPECTED_CORRUPTION",JSON.stringify(tests.map(t=>({name:t.fullName,status:t.status}))));
+          NODE
+          package_link=extensions/code-mode-quickjs/node_modules/quickjs-wasi
+          test -L "$package_link"
+          original_package=$(readlink "$package_link")
+          cp -R "$(realpath "$package_link")" "$proof_root/package"
+          cp ../dist/* "$proof_root/package/dist/"
+          unlink "$package_link"
+          ln -s "$proof_root/package" "$package_link"
+          trap 'unlink "$package_link"; ln -s "$original_package" "$package_link"; rm -rf "$proof_root"' EXIT
+          printf 'MATCHED_WASM '; sha256sum "$proof_root/package/quickjs.wasm"
+          node scripts/run-vitest.mjs src/agents/code-mode-quickjs.integration.test.ts src/agents/code-mode-engine-parity.test.ts --maxWorkers=1
