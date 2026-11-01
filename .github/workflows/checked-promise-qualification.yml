@@ -13,6 +13,7 @@ jobs:
         with:
           ref: 4f1a33ea45081a126dd6e64c23dfe7309b5a88b8
           submodules: recursive
+          fetch-depth: 2
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
