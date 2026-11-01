@@ -1,0 +1,168 @@
+name: Checked Promise construction qualification
+on:
+  push:
+    branches: [ci/checked-promise-construction]
+permissions:
+  contents: read
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 4f1a33ea45081a126dd6e64c23dfe7309b5a88b8
+          submodules: recursive
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.1
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: make setup
+      - name: Build complete matched parent
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          git -C quickjs-ng rev-parse HEAD
+          cat /tmp/wasi-sdk/VERSION
+          git show cc24ca06dc997b59c6a94709175b801e3719e871:c/interface.c > c/interface.c
+          git show cc24ca06dc997b59c6a94709175b801e3719e871:src/index.ts > src/index.ts
+          pnpm run build
+          cp quickjs.wasm "$RUNNER_TEMP/baseline.wasm"
+          cp -R dist "$RUNNER_TEMP/baseline-dist"
+      - name: Build exact source candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          git restore --source=HEAD c/interface.c src/index.ts
+          pnpm run build
+          cp quickjs.wasm "$RUNNER_TEMP/candidate.wasm"
+          cp -R dist "$RUNNER_TEMP/candidate-dist"
+          sha256sum quickjs.wasm dist/index.js
+          git diff --exit-code
+      - name: Full candidate suite
+        shell: bash
+        run: |
+          set +e
+          pnpm test --reporter=json --outputFile="$RUNNER_TEMP/promise-candidate.json"
+          status=$?
+          set -e
+          node --input-type=module <<'JS'
+          import {readFileSync} from 'node:fs';
+          const r=JSON.parse(readFileSync(process.env.RUNNER_TEMP+'/promise-candidate.json'));
+          console.log('PROMISE_CANDIDATE_SUITE',JSON.stringify({passed:r.numPassedTests,failed:r.numFailedTests,files:r.testResults.length,failures:r.testResults.flatMap(x=>x.assertionResults).filter(x=>x.status==='failed').map(x=>({title:x.title,messages:x.failureMessages}))}));
+          
+          JS
+          exit "$status"
+      - name: Old C with candidate TypeScript negative control
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "$RUNNER_TEMP/baseline.wasm" quickjs.wasm
+          set +e
+          pnpm test test/promise-construction-failures.test.ts --reporter=json --outputFile="$RUNNER_TEMP/promise-old-c.json"
+          status=$?
+          set -e
+          node --input-type=module <<'JS'
+          import {readFileSync} from 'node:fs';
+          const r=JSON.parse(readFileSync(process.env.RUNNER_TEMP+'/promise-old-c.json'));
+          console.log('PROMISE_OLD_C_RED',JSON.stringify({passed:r.numPassedTests,failed:r.numFailedTests,files:r.testResults.length,failures:r.testResults.flatMap(x=>x.assertionResults).filter(x=>x.status==='failed').map(x=>({title:x.title,messages:x.failureMessages}))}));
+          if(!r.numFailedTests)throw new Error('negative control must fail');
+          JS
+          test "$status" -ne 0
+          cp "$RUNNER_TEMP/candidate.wasm" quickjs.wasm
+      - name: Old TypeScript with candidate C negative control
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show cc24ca06dc997b59c6a94709175b801e3719e871:src/index.ts > src/index.ts
+          set +e
+          pnpm test test/promise-construction-failures.test.ts --reporter=json --outputFile="$RUNNER_TEMP/promise-old-ts.json"
+          status=$?
+          set -e
+          node --input-type=module <<'JS'
+          import {readFileSync} from 'node:fs';
+          const r=JSON.parse(readFileSync(process.env.RUNNER_TEMP+'/promise-old-ts.json'));
+          console.log('PROMISE_OLD_TS_RED',JSON.stringify({passed:r.numPassedTests,failed:r.numFailedTests,files:r.testResults.length,failures:r.testResults.flatMap(x=>x.assertionResults).filter(x=>x.status==='failed').map(x=>({title:x.title,messages:x.failureMessages}))}));
+          if(!r.numFailedTests)throw new Error('negative control must fail');
+          JS
+          test "$status" -ne 0
+          git restore --source=HEAD src/index.ts
+          git diff --exit-code
+      - name: Matched successful Promise cost
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/promise-cost.mjs" <<'JS'
+          import assert from 'node:assert/strict';
+          import {readFileSync} from 'node:fs';
+          import {createHash} from 'node:crypto';
+          import {cpus,loadavg,freemem} from 'node:os';
+          import {pathToFileURL} from 'node:url';
+          import {resolve} from 'node:path';
+          const [moduleRoot,wasmPath,arm,pair]=process.argv.slice(2);
+          const {QuickJS}=await import(pathToFileURL(resolve(moduleRoot,'index.js')));
+          const hash=b=>createHash('sha256').update(b).digest('hex');
+          const bytes=readFileSync(wasmPath),wasm=await WebAssembly.compile(bytes);
+          const env=()=>({load:loadavg(),freeMemoryBytes:freemem()});
+          const start=env(),rows=[];
+          for(const kind of ['resolve','reject','settled']){
+            using vm=await QuickJS.create({wasm,memoryLimit:64*1024*1024});
+            void vm.true;void vm.undefined;
+            const owned=vm._ownedHandles.size;
+            const samples=[];
+            for(let round=-20;round<40;round++){
+              const deferred=[],settled=[],cpu=process.cpuUsage(),at=performance.now();
+              for(let i=0;i<1000;i++){
+                const d=vm.newPromise();
+                deferred.push(d);
+                if(kind==='settled')settled.push(d.settled);
+                if(kind==='reject')d.reject(vm.true);else d.resolve(vm.true);
+              }
+              const wallMs=performance.now()-at,elapsed=process.cpuUsage(cpu);
+              vm.executePendingJobs();await Promise.all(settled);
+              for(const d of deferred){
+                assert(d.handle.isPromise);
+                assert.equal(d.handle.promiseState,kind==='reject'?2:1);
+                vm.markPromiseHandled(d.handle);
+                const result=await vm.resolvePromise(d.handle);
+                assert.equal('value' in result,kind!=='reject');
+                const value='value' in result?result.value:result.error;
+                assert.equal(value.toBoolean(),true);value.dispose();d.handle.dispose();
+              }
+              vm.runGC();
+              assert.equal(vm._ownedHandles.size,owned);
+              assert.equal(vm.hostCallbacks.size,0);
+              using pending=vm.getException();
+              assert.equal(vm._getExports().qjs_typeof(pending.ptr),4);
+              if(round>=0)samples.push({wallMs,cpuMs:(elapsed.user+elapsed.system)/1000});
+            }
+            rows.push({kind,samples});
+          }
+          console.log(JSON.stringify({arm,pair:Number(pair),node:process.version,cpu:cpus()[0]?.model,start,end:env(),wasmSha256:hash(bytes),moduleSha256:hash(readFileSync(resolve(moduleRoot,'index.js'))),probeSha256:hash(readFileSync(new URL(import.meta.url))),rows,warmups:20,rounds:40,operationsPerBatch:1000}));
+          JS
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import {execFileSync} from 'node:child_process';
+          const results=[];
+          for(let pair=0;pair<5;pair++)for(const arm of pair%2?['candidate','baseline']:['baseline','candidate']){
+            const r=JSON.parse(execFileSync(process.execPath,[process.env.RUNNER_TEMP+'/promise-cost.mjs',process.env.RUNNER_TEMP+'/'+arm+'-dist',process.env.RUNNER_TEMP+'/'+arm+'.wasm',arm,String(pair)],{encoding:'utf8',timeout:300000,maxBuffer:1024*1024}));
+            results.push(r);console.log('PROMISE_RAW',JSON.stringify(r));
+          }
+          const median=a=>[...a].sort((x,y)=>x-y)[Math.floor(a.length/2)];
+          const p95=a=>[...a].sort((x,y)=>x-y)[Math.ceil(a.length*.95)-1];
+          for(const r of results){
+            assert.equal(r.probeSha256,results[0].probeSha256);assert.equal(r.node,results[0].node);
+            assert.equal(r.wasmSha256,results.find(x=>x.arm===r.arm).wasmSha256);
+            assert.equal(r.moduleSha256,results.find(x=>x.arm===r.arm).moduleSha256);
+            for(const row of r.rows)for(const s of row.samples)assert(Number.isFinite(s.wallMs)&&s.wallMs>0&&Number.isFinite(s.cpuMs)&&s.cpuMs>0);
+          }
+          const summary=results[0].rows.map(row=>({kind:row.kind,pairs:Array.from({length:5},(_,pair)=>{
+            const arms=Object.fromEntries(results.filter(r=>r.pair===pair).map(r=>[r.arm,r.rows.find(x=>x.kind===row.kind).samples]));
+            const metrics=Object.fromEntries(Object.entries(arms).map(([arm,a])=>[arm,{wallMedianMs:median(a.map(s=>s.wallMs)),cpuMedianMs:median(a.map(s=>s.cpuMs)),wallP95Ms:p95(a.map(s=>s.wallMs)),earlyMedianMs:median(a.slice(0,10).map(s=>s.wallMs)),lateMedianMs:median(a.slice(-10).map(s=>s.wallMs))}]));
+            return{pair,arms:metrics,wallRatio:metrics.candidate.wallMedianMs/metrics.baseline.wallMedianMs,cpuRatio:metrics.candidate.cpuMedianMs/metrics.baseline.cpuMedianMs};
+          })}));
+          console.log('PROMISE_SUMMARY',JSON.stringify(summary));
+          JS
