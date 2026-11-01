@@ -1,42 +1,180 @@
-name: CI
-
+name: Function construction qualification
 on:
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-
+    branches: [ci/checked-function-construction]
 jobs:
-  build-and-test:
-    name: Build & Test
+  qualify:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 20
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
+          ref: cc24ca06dc997b59c6a94709175b801e3719e871
+          fetch-depth: 2
           submodules: recursive
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: 24.22.1
           cache: pnpm
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Setup wasi-sdk
-        run: make setup
-
-      - name: Build WASM
-        run: pnpm run build:wasm
-
-      - name: Build TypeScript
-        run: pnpm run build:ts
-
-      - name: Run tests
-        run: pnpm test
+      - run: pnpm install --frozen-lockfile
+      - run: make setup
+      - run: pnpm run build
+      - name: Full candidate tests
+        shell: bash
+        run: |
+          set +e
+          pnpm test --reporter=json --outputFile="$RUNNER_TEMP/candidate-tests.json"
+          status=$?
+          set -e
+          node --input-type=module <<'JS'
+          import { readFileSync } from 'node:fs';
+          const r = JSON.parse(readFileSync(process.env.RUNNER_TEMP + '/candidate-tests.json'));
+          console.log('CANDIDATE_SUITE', JSON.stringify({ passed:r.numPassedTests, failed:r.numFailedTests, suites:r.numPassedTestSuites, failures:r.testResults.flatMap(x=>x.assertionResults).filter(x=>x.status==='failed').map(x=>({title:x.title,messages:x.failureMessages})) }));
+          JS
+          exit "$status"
+      - name: Native negative control and matched parent build
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD HEAD^
+          git submodule status
+          cat /tmp/wasi-sdk/VERSION
+          cp quickjs.wasm "$RUNNER_TEMP/candidate.wasm"
+          cp -R dist "$RUNNER_TEMP/candidate-dist"
+          git show cb0bed1a7c40011e708fb934504906e55dfb71eb:c/interface.c > c/interface.c
+          make quickjs.wasm
+          cp quickjs.wasm "$RUNNER_TEMP/baseline.wasm"
+          set +e
+          pnpm test test/function-construction-failures.test.ts --reporter=json --outputFile="$RUNNER_TEMP/native-red.json"
+          status=$?
+          set -e
+          test "$status" -eq 1
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          const r=JSON.parse(readFileSync(process.env.RUNNER_TEMP+'/native-red.json'));
+          const failures=r.testResults.flatMap(x=>x.assertionResults).filter(x=>x.status==='failed');
+          console.log('NATIVE_RED',JSON.stringify({failed:r.numFailedTests,passed:r.numPassedTests,failures:failures.map(x=>({title:x.title,messages:x.failureMessages}))}));
+          assert.equal(r.numFailedTests,4);
+          assert.equal(r.numPassedTests,28);
+          assert.deepEqual(failures.map(x=>x.title).sort(),[
+            'rejects failed name initialization without reserving the name',
+            'rejects failed properties initialization without reserving the name',
+            'replaces an earlier exception with fresh name construction failure',
+            'replaces an earlier exception with fresh properties construction failure',
+          ].sort());
+          JS
+          git show cb0bed1a7c40011e708fb934504906e55dfb71eb:src/index.ts > src/index.ts
+          pnpm run build:ts
+          cp -R dist "$RUNNER_TEMP/baseline-dist"
+          git restore c/interface.c src/index.ts
+          cp "$RUNNER_TEMP/candidate.wasm" quickjs.wasm
+          rm -rf dist
+          cp -R "$RUNNER_TEMP/candidate-dist" dist
+          git diff --exit-code -- c/interface.c src/index.ts
+          sha256sum "$RUNNER_TEMP/"{baseline,candidate}.wasm "$RUNNER_TEMP/"{baseline,candidate}-dist/*.js
+      - name: Matched constructor and subscription cost
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/function-cost.mjs" <<'JS'
+          import assert from 'node:assert/strict';
+          import { createHash } from 'node:crypto';
+          import { readFileSync,readdirSync } from 'node:fs';
+          import { cpus,loadavg,freemem } from 'node:os';
+          import { resolve } from 'node:path';
+          import { pathToFileURL } from 'node:url';
+          const [moduleRoot,wasmPath,arm,pair]=process.argv.slice(2);
+          const { QuickJS }=await import(pathToFileURL(resolve(moduleRoot,'index.js')));
+          const hash=b=>createHash('sha256').update(b).digest('hex');
+          const bytes=readFileSync(wasmPath),wasm=await WebAssembly.compile(bytes);
+          const env=()=>({load:loadavg(),freeMemoryBytes:freemem()});
+          const start=env(),rows=[];
+          for(const name of ['named-ascii','named-unicode','ephemeral','resolve-setup','settled-setup','dump-object']){
+            using vm=await QuickJS.create({wasm,memoryLimit:64*1024*1024});
+            const names=Array.from({length:1000},(_,i)=>(name==='named-unicode'?'probe_\u0100\ud83e\udd8a_':'probe_')+i);
+            const calls=new Uint32Array(1000);
+            const callbacks=names.map((_,i)=>()=>{calls[i]++;return vm.true;});
+            const values=Array.from({length:1000},(_,i)=>({i,label:'value_'+i,ok:true}));
+            const objects=name==='dump-object'?values.map(value=>vm.hostToHandle(value)):[];
+            const samples=[];
+            for(let round=-20;round<40;round++){
+              calls.fill(0);
+              const handles=[],hosts=[],dumps=[];
+              const deferreds=name.endsWith('setup')?Array.from({length:1000},()=>vm.newPromise()):[];
+              const cpu=process.cpuUsage(),at=performance.now();
+              for(let i=0;i<1000;i++){
+                if(name==='dump-object')dumps.push(vm.dump(objects[i]));
+                else if(name==='resolve-setup')hosts.push(vm.resolvePromise(deferreds[i].handle));
+                else if(name==='settled-setup')hosts.push(deferreds[i].settled);
+                else handles.push(name==='ephemeral'?vm.newEphemeralFunction(callbacks[i]):vm.newFunction(names[i],callbacks[i]));
+              }
+              const wallMs=performance.now()-at,elapsedCpu=process.cpuUsage(cpu);
+              try{
+                if(objects.length){
+                  for(let i=0;i<1000;i++)assert.deepEqual(dumps[i],values[i]);
+                }else if(deferreds.length){
+                  if(name==='settled-setup')for(let i=0;i<1000;i++)assert.equal(deferreds[i].settled,hosts[i]);
+                  for(const d of deferreds)d.resolve(vm.true);
+                  vm.executePendingJobs();
+                  const results=await Promise.all(hosts);
+                  if(name==='resolve-setup')for(const result of results){
+                    assert('value' in result);
+                    assert.equal(result.value.consume(value=>value.toBoolean()),true);
+                  }
+                }else{
+                  const ephemeralNames=new Set();
+                  for(let i=0;i<1000;i++){
+                    for(const key of ['name','length']){
+                      const d=handles[i].getOwnPropertyDescriptor(key);
+                      assert(d&&d.value);
+                      try{
+                        assert.equal(d.enumerable,false);assert.equal(d.configurable,true);assert.equal(d.writable,false);
+                        if(key==='length')assert.equal(d.value.toNumber(),0);
+                        else if(name==='ephemeral'){const text=d.value.toString();assert.match(text,/^__ephemeral:[1-9][0-9]*$/);ephemeralNames.add(text);}
+                        else assert.equal(d.value.toString(),names[i]);
+                      }finally{d.value?.dispose();d.get?.dispose();d.set?.dispose();}
+                    }
+                    assert.equal(vm.callFunction(handles[i],vm.undefined).consume(value=>value.toBoolean()),true);
+                    assert.equal(calls[i],1);
+                  }
+                  if(name==='ephemeral')assert.equal(ephemeralNames.size,1000);
+                }
+              }finally{
+                for(const h of handles)h.dispose();
+                if(name.startsWith('named-'))for(const callbackName of names)assert.equal(vm.unregisterHostCallback(callbackName),true);
+                for(const d of deferreds)d.handle.dispose();
+              }
+              vm.runGC();
+              if(round>=0)samples.push({wallMs,cpuMs:(elapsedCpu.user+elapsedCpu.system)/1000});
+            }
+            for(const object of objects)object.dispose();
+            rows.push({name,samples});
+          }
+          console.log(JSON.stringify({arm,pair:Number(pair),node:process.version,cpu:cpus()[0]?.model,start,end:env(),wasmSha256:hash(bytes),probeSha256:hash(readFileSync(new URL(import.meta.url))),moduleSha256:Object.fromEntries(readdirSync(moduleRoot).filter(x=>x.endsWith('.js')).sort().map(x=>[x,hash(readFileSync(resolve(moduleRoot,x)))])),warmups:20,rounds:40,operationsPerBatch:1000,rows}));
+          JS
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { execFileSync } from 'node:child_process';
+          const results=[];
+          for(let pair=0;pair<5;pair++)for(const arm of pair%2?['candidate','baseline']:['baseline','candidate']){
+            const r=JSON.parse(execFileSync(process.execPath,[process.env.RUNNER_TEMP+'/function-cost.mjs',process.env.RUNNER_TEMP+'/'+arm+'-dist',process.env.RUNNER_TEMP+'/'+arm+'.wasm',arm,String(pair)],{encoding:'utf8',timeout:300000,maxBuffer:2*1024*1024}));
+            results.push(r);console.log('FUNCTION_RAW',JSON.stringify(r));
+          }
+          const median=a=>[...a].sort((x,y)=>x-y)[Math.floor(a.length/2)];
+          const p95=a=>[...a].sort((x,y)=>x-y)[Math.ceil(a.length*.95)-1];
+          for(const r of results){
+            assert.equal(r.probeSha256,results[0].probeSha256);
+            assert.equal(r.node,results[0].node);
+            const first=results.find(x=>x.arm===r.arm);
+            assert.deepEqual(r.moduleSha256,first.moduleSha256);
+            assert.equal(r.wasmSha256,first.wasmSha256);
+          }
+          const summary=results[0].rows.map(row=>({name:row.name,pairs:Array.from({length:5},(_,pair)=>{
+            const arms=Object.fromEntries(results.filter(r=>r.pair===pair).map(r=>[r.arm,r.rows.find(x=>x.name===row.name).samples]));
+            const metrics=Object.fromEntries(Object.entries(arms).map(([arm,a])=>[arm,{wallMedianMs:median(a.map(s=>s.wallMs)),cpuMedianMs:median(a.map(s=>s.cpuMs)),wallP95Ms:p95(a.map(s=>s.wallMs)),earlyMedianMs:median(a.slice(0,10).map(s=>s.wallMs)),lateMedianMs:median(a.slice(-10).map(s=>s.wallMs))}]));
+            return{pair,arms:metrics,wallRatio:metrics.candidate.wallMedianMs/metrics.baseline.wallMedianMs,cpuRatio:metrics.candidate.cpuMedianMs/metrics.baseline.cpuMedianMs};
+          })}));
+          console.log('FUNCTION_SUMMARY',JSON.stringify(summary));
+          JS
