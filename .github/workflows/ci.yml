@@ -1,42 +1,210 @@
-name: CI
-
+name: NG conversion recovery qualification
 on:
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-
+    branches: [ci/ng-cstring-recovery]
+permissions:
+  contents: read
 jobs:
-  build-and-test:
-    name: Build & Test
+  qualify:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 25
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
+          ref: cc24ca06dc997b59c6a94709175b801e3719e871
           submodules: recursive
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: 24.22.1
           cache: pnpm
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Setup wasi-sdk
-        run: make setup
-
-      - name: Build WASM
-        run: pnpm run build:wasm
-
-      - name: Build TypeScript
-        run: pnpm run build:ts
-
-      - name: Run tests
-        run: pnpm test
+      - run: pnpm install --frozen-lockfile
+      - run: make setup
+      - name: Build matched pinned baseline
+        run: |
+          pnpm run build
+          cp quickjs.wasm "$RUNNER_TEMP/baseline.wasm"
+          git rev-parse HEAD
+          git -C quickjs-ng rev-parse HEAD
+          cat /tmp/wasi-sdk/VERSION
+          sha256sum quickjs-ng/quickjs.c
+      - name: Apply only NG 1850 converter fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C quickjs-ng rev-parse HEAD)" = 6d46d07d04041b40f4f49eaa7fdebe44c314c699
+          python3 <<'PY'
+          from pathlib import Path
+          p=Path('quickjs-ng/quickjs.c')
+          s=p.read_text()
+          old='fail:\n    if (plen)\n        *plen = 0;\n    return NULL;\n}\n\nstatic void copy_str16'
+          new='fail:\n    JS_FreeValue(ctx, val);\n    if (plen)\n        *plen = 0;\n    return NULL;\n}\n\nstatic void copy_str16'
+          assert s.count(old)==1
+          p.write_text(s.replace(old,new))
+          PY
+          git -C quickjs-ng diff --check
+          git -C quickjs-ng diff -- quickjs.c
+          sha256sum quickjs-ng/quickjs.c
+          pnpm run build
+          cp quickjs.wasm "$RUNNER_TEMP/candidate.wasm"
+      - name: Full WASI candidate suite
+        shell: bash
+        run: |
+          set +e
+          pnpm test --reporter=json --outputFile="$RUNNER_TEMP/ng-candidate.json"
+          status=$?
+          set -e
+          node --input-type=module <<'JS'
+          import {readFileSync} from 'node:fs';
+          const r=JSON.parse(readFileSync(process.env.RUNNER_TEMP+'/ng-candidate.json'));
+          console.log('NG_CANDIDATE_SUITE',JSON.stringify({passed:r.numPassedTests,failed:r.numFailedTests,files:r.testResults.length,failures:r.testResults.flatMap(x=>x.assertionResults).filter(x=>x.status==='failed').map(x=>({title:x.title,messages:x.failureMessages}))}));
+          JS
+          exit "$status"
+      - name: Public WASI lifetime controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/lifetime.mjs" <<'JS'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          import { createHash } from 'node:crypto';
+          import { pathToFileURL } from 'node:url';
+          import { resolve } from 'node:path';
+          const [moduleRoot,wasmFile,arm]=process.argv.slice(2);
+          const {QuickJS}=await import(pathToFileURL(resolve(moduleRoot,'index.js')));
+          const bytes=readFileSync(wasmFile),wasm=await WebAssembly.compile(bytes);
+          const pick=v=>({mallocSize:v.mallocSize,mallocCount:v.mallocCount,strCount:v.strCount,strSize:v.strSize,objCount:v.objCount});
+          const rows=[];
+          for(const kind of ['ascii','latin1','wide'])for(const mode of ['skip','low','ample']){
+            const text=(kind==='ascii'?'x':kind==='latin1'?'\u00e9':'\u0100').repeat(262144);
+            const cap=kind==='wide'?1024*1024:512*1024;
+            const memoryLimit=mode==='ample'?16*1024*1024:cap;
+            using vm=await QuickJS.create({wasm,memoryLimit});
+            void vm.true;void vm.undefined;vm.runGC();
+            const before=pick(vm.getMemoryUsage());
+            const value=vm.newString(text);assert(value.isString);
+            const live=pick(vm.getMemoryUsage());
+            let failed=false;
+            if(mode!=='skip'){
+              const output=value.toString();
+              failed=mode==='low'&&kind!=='ascii';
+              if(failed){
+                assert.equal(output,'<null>');
+                using error=vm.getException();
+                assert(error.isError);
+                assert.equal(error.getProp('name').consume(v=>v.toString()),'InternalError');
+                assert.equal(error.getProp('message').consume(v=>v.toString()),'out of memory');
+                assert.equal(value.length,text.length,'failed conversion must preserve the caller-owned string');
+              }else assert.equal(output,text);
+            }
+            value.dispose();vm.runGC();
+            const after=pick(vm.getMemoryUsage()),retained=after.mallocSize-before.mallocSize;
+            if(failed&&arm==='baseline')assert(retained>=text.length,'unfixed binary must retain the input allocation');
+            else assert(retained<64*1024,'released input must return close to baseline');
+            rows.push({kind,mode,memoryLimit,before,live,after,retained,failed});
+          }
+          {
+            using vm=await QuickJS.create({wasm});
+            using value=vm.evalCode('({toString(){throw new Error("coercion failed")}})');
+            assert.equal(value.toString(),'<null>');
+            using error=vm.getException();
+            assert.equal(error.getProp('message').consume(v=>v.toString()),'coercion failed');
+          }
+          console.log('CONVERSION_LIFETIME',JSON.stringify({arm,node:process.version,wasmSha256:createHash('sha256').update(bytes).digest('hex'),rows,coercionFailurePreserved:true}));
+          JS
+          node "$RUNNER_TEMP/lifetime.mjs" dist "$RUNNER_TEMP/baseline.wasm" baseline
+          node "$RUNNER_TEMP/lifetime.mjs" dist "$RUNNER_TEMP/candidate.wasm" candidate
+      - name: Matched successful conversion cost
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/conversion-cost.mjs" <<'JS'
+          import assert from 'node:assert/strict';
+          import {readFileSync} from 'node:fs';
+          import {createHash} from 'node:crypto';
+          import {cpus,loadavg,freemem} from 'node:os';
+          import {pathToFileURL} from 'node:url';
+          import {resolve} from 'node:path';
+          const [moduleRoot,wasmPath,arm,pair]=process.argv.slice(2);
+          const {QuickJS}=await import(pathToFileURL(resolve(moduleRoot,'index.js')));
+          const hash=b=>createHash('sha256').update(b).digest('hex');
+          const bytes=readFileSync(wasmPath),wasm=await WebAssembly.compile(bytes);
+          const env=()=>({load:loadavg(),freeMemoryBytes:freemem()});
+          const start=env(),rows=[];
+          for(const kind of ['ascii','latin1','wide']){
+            const texts=Array.from({length:1000},(_,i)=>(String(i)+':').padEnd(1024,kind==='ascii'?'x':kind==='latin1'?'\u00e9':'\u0100'));
+            using vm=await QuickJS.create({wasm,memoryLimit:64*1024*1024});
+            const handles=texts.map(text=>vm.newString(text));
+            assert(handles.every(handle=>handle.isString));
+            const samples=[];
+            for(let round=-20;round<40;round++){
+              const results=[],cpu=process.cpuUsage(),at=performance.now();
+              for(const handle of handles)results.push(handle.toString());
+              const wallMs=performance.now()-at,elapsed=process.cpuUsage(cpu);
+              assert.deepEqual(results,texts);
+              vm.runGC();
+              if(round>=0)samples.push({wallMs,cpuMs:(elapsed.user+elapsed.system)/1000});
+            }
+            for(const handle of handles)handle.dispose();
+            rows.push({kind,samples});
+          }
+          console.log(JSON.stringify({arm,pair:Number(pair),node:process.version,cpu:cpus()[0]?.model,start,end:env(),wasmSha256:hash(bytes),moduleSha256:hash(readFileSync(resolve(moduleRoot,'index.js'))),probeSha256:hash(readFileSync(new URL(import.meta.url))),rows,warmups:20,rounds:40,operationsPerBatch:1000,stringLength:1024}));
+          JS
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import {execFileSync} from 'node:child_process';
+          const results=[];
+          for(let pair=0;pair<5;pair++)for(const arm of pair%2?['candidate','baseline']:['baseline','candidate']){
+            const r=JSON.parse(execFileSync(process.execPath,[process.env.RUNNER_TEMP+'/conversion-cost.mjs','dist',process.env.RUNNER_TEMP+'/'+arm+'.wasm',arm,String(pair)],{encoding:'utf8',timeout:300000,maxBuffer:1024*1024}));
+            results.push(r);console.log('CONVERSION_RAW',JSON.stringify(r));
+          }
+          const median=a=>[...a].sort((x,y)=>x-y)[Math.floor(a.length/2)];
+          const p95=a=>[...a].sort((x,y)=>x-y)[Math.ceil(a.length*.95)-1];
+          for(const r of results){
+            assert.equal(r.probeSha256,results[0].probeSha256);
+            assert.equal(r.moduleSha256,results[0].moduleSha256);
+            assert.equal(r.node,results[0].node);
+            assert.equal(r.wasmSha256,results.find(x=>x.arm===r.arm).wasmSha256);
+            for(const row of r.rows)for(const s of row.samples)assert(Number.isFinite(s.wallMs)&&s.wallMs>0&&Number.isFinite(s.cpuMs)&&s.cpuMs>0);
+          }
+          const summary=results[0].rows.map(row=>({kind:row.kind,pairs:Array.from({length:5},(_,pair)=>{
+            const arms=Object.fromEntries(results.filter(r=>r.pair===pair).map(r=>[r.arm,r.rows.find(x=>x.kind===row.kind).samples]));
+            const metrics=Object.fromEntries(Object.entries(arms).map(([arm,a])=>[arm,{wallMedianMs:median(a.map(s=>s.wallMs)),cpuMedianMs:median(a.map(s=>s.cpuMs)),wallP95Ms:p95(a.map(s=>s.wallMs)),earlyMedianMs:median(a.slice(0,10).map(s=>s.wallMs)),lateMedianMs:median(a.slice(-10).map(s=>s.wallMs))}]));
+            return{pair,arms:metrics,wallRatio:metrics.candidate.wallMedianMs/metrics.baseline.wallMedianMs,cpuRatio:metrics.candidate.cpuMedianMs/metrics.baseline.cpuMedianMs};
+          })}));
+          console.log('CONVERSION_SUMMARY',JSON.stringify(summary));
+          JS
+      - uses: actions/checkout@v4
+        with:
+          repository: quickjs-ng/quickjs
+          ref: a41d1022accb4ed3f940a106f0eb9d673c3574da
+          path: ng-upstream
+          persist-credentials: false
+      - name: Exact upstream native API suite and negative control
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          git -C ng-upstream rev-parse HEAD
+          cmake -S ng-upstream -B "$RUNNER_TEMP/ng-api-build" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$RUNNER_TEMP/ng-api-build" --target api-test -j2
+          "$RUNNER_TEMP/ng-api-build/api-test"
+          echo 'NG_NATIVE_CANDIDATE_PASS a41d1022accb4ed3f940a106f0eb9d673c3574da'
+          python3 <<'PY'
+          from pathlib import Path
+          p=Path('ng-upstream/quickjs.c')
+          s=p.read_text()
+          old='fail:\n    JS_FreeValue(ctx, val);\n    if (plen)\n        *plen = 0;\n    return NULL;\n}\n\nstatic void copy_str16'
+          new='fail:\n    if (plen)\n        *plen = 0;\n    return NULL;\n}\n\nstatic void copy_str16'
+          assert s.count(old)==1
+          p.write_text(s.replace(old,new))
+          PY
+          cmake --build "$RUNNER_TEMP/ng-api-build" --target api-test -j2
+          python3 <<'PY'
+          import subprocess,os,json,signal
+          p=subprocess.run([os.environ['RUNNER_TEMP']+'/ng-api-build/api-test'],capture_output=True,text=True)
+          print('NG_NATIVE_RED',json.dumps({'returncode':p.returncode,'stderr':p.stderr}))
+          assert p.returncode==-signal.SIGABRT
+          assert 'to_cstring_oom' in p.stderr
+          assert 'after.malloc_size - before.malloc_size' in p.stderr
+          PY
